@@ -1,0 +1,64 @@
+From: Diogo Trindade <diogotr7@gmail.com>
+Date: Thu, 23 Jul 2026 00:00:00 +0100
+Subject: [PATCH] input: rsinput: make the MCU report rate configurable
+
+The MCU report period was hardcoded in the SET_PAR init command (0x07,
+i.e. ~111 Hz). Expose it via a "report_period" module parameter and a
+"report-period" devicetree property. Default stays 7 -> no behaviour
+change; lower values poll faster (empirically interval ~= (period + 2) ms,
+so 3 -> ~200 Hz, 2 -> ~250 Hz).
+
+The MCU is event-driven and, at these rates, each frame still arrives in
+its own receive_buf() callback, so the existing parser delivers them
+losslessly (measured 0 dropped frames over 8 s at 250 Hz on a Retroid
+Pocket 6; rate linear across 45-250 Hz).
+---
+ drivers/input/joystick/rsinput.c | 21 +++++++++-----
+ 1 file changed, 20 insertions(+), 1 deletions(-)
+
+--- a/drivers/input/joystick/rsinput.c
++++ b/drivers/input/joystick/rsinput.c
+@@ -143,6 +143,18 @@
+ static bool rumble_enable = true;
+ module_param(rumble_enable, bool, 0660);
+ 
++/*
++ * MCU status-report period. The MCU decimates its internal sampling by this
++ * value before emitting a CMD_STATUS frame, so lower = higher polling rate:
++ *   7 -> ~111 Hz (default, original behaviour)   3 -> ~200 Hz
++ *   2 -> ~250 Hz                                  1 -> continuous / maximum
++ * Overridable per-board via the "report-period" devicetree property.
++ */
++static int report_period = 7;
++module_param(report_period, int, 0660);
++MODULE_PARM_DESC(report_period,
++    "MCU report period; lower = faster polling (7=111Hz default, 3=200Hz, 2=250Hz, 1=max)");
++
+ static const unsigned int keymap[] = {
+     BTN_DPAD_UP, BTN_DPAD_DOWN, BTN_DPAD_LEFT, BTN_DPAD_RIGHT,
+     BTN_NORTH,   BTN_WEST,	    BTN_EAST,	   BTN_SOUTH,
+@@ -219,7 +231,8 @@
+         DATA_COMMOD_SET_PAR,
+         0x01,
+         0x00, 0x00, 0x00, 0x28,
+-        0x00, 0x00, 0x00, 0x07
++        (report_period >> 24) & 0xFF, (report_period >> 16) & 0xFF,
++        (report_period >> 8) & 0xFF, report_period & 0xFF
+     };
+     error = rsinput_send_command(drv, CMD_COMMOD, mcu_params, sizeof(mcu_params));
+     if (error < 0) {
+@@ -479,6 +492,14 @@
+         }
+     }
+ 
++    {
++        u32 rp;
++        if (!device_property_read_u32(&serdev->dev, "report-period", &rp)) {
++            report_period = rp;
++            dev_info(&serdev->dev, "DT report-period override: %u\n", rp);
++        }
++    }
++
+     drv->vdd = devm_regulator_get(&serdev->dev, "vdd");
+     if (IS_ERR(drv->vdd)) {
+         error = PTR_ERR(drv->vdd);
