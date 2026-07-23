@@ -129,6 +129,7 @@
 
 &gamepad {
 	axis-range = <1024>;
+	report-period = <2>;
 };
 
 &mdss_dsi0 {
