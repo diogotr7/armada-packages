@@ -48,6 +48,7 @@
 1003-rsinput-add-ff.patch          # rumble — keep after 1000/1002 (patches qcom-hv-haptics.c) and before 1300
 1300-input-rsinput-ranges.patch
 1301-input-rsinput-configurable-report-rate.patch
+1302-input-rsinput-streaming-rx-parser.patch
 
 # ============== Audio ==============
 0036_ASoC--qcom--sc8280xp-Add-support-for-Primary-I2S.patch

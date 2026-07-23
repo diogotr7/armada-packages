@@ -1,0 +1,176 @@
+From: Diogo Trindade <diogotr7@gmail.com>
+Date: Thu, 23 Jul 2026 00:00:00 +0100
+Subject: [PATCH] input: rsinput: stream-parse the MCU RX
+
+receive_buf() assumed exactly one frame per callback and validated one
+checksum over the whole buffer, so any callback carrying more than one
+frame (or a frame split across callbacks) was dropped. Per the serdev
+contract the callback may be handed arbitrary byte boundaries. Rewrite it
+as a streaming parser: accumulate across callbacks, resync on the 4-byte
+frame header, dispatch every complete checksum-valid frame, and retain any
+partial trailing frame for the next call.
+
+This is a correctness/robustness fix. At the rates currently shipped
+(<= 250 Hz) frames arrive one-per-callback in practice, so no dropped-frame
+difference was measured versus the old parser; the benefit is for higher
+report rates and batched delivery.
+---
+ drivers/input/joystick/rsinput.c | 100 +++++++++-----
+ 1 file changed, 55 insertions(+), 45 deletions(-)
+
+--- a/drivers/input/joystick/rsinput.c
++++ b/drivers/input/joystick/rsinput.c
+@@ -121,6 +121,7 @@
+ #define FRAME_POS_DATA_14         21
+ 
+ #define MCU_PKT_SIZE_MIN          9
++#define MCU_PKT_SIZE_MAX          256
+ 
+ #define MCU_VERSION_MAX_LEN       64
+ 
+@@ -136,7 +137,8 @@
+     bool invert_y;
+     bool invert_rx;
+     bool invert_ry;
+-    uint8_t rx_buf[1024];
++    uint8_t rx_buf[4096];
++    size_t rx_len;
+     uint8_t sequence_number;
+ };
+ 
+@@ -342,77 +344,81 @@
+     }
+ }
+ 
+-static void rsinput_process_data(struct rsinput_driver *drv, const uint8_t *data, size_t len) {
+-    while (len >= MCU_PKT_SIZE_MIN) {
+-        uint16_t payload_length = data[FRAME_POS_LEN_L] | (data[FRAME_POS_LEN_H] << 8);
+-        size_t frame_length = MCU_PKT_SIZE_MIN + payload_length;
++/*
++ * Parse the MCU byte stream into frames. The MCU streams CMD_STATUS frames
++ * back-to-back, so a single receive_buf() callback may carry several frames, a
++ * frame split across callbacks, or resume mid-frame. Accumulate into rx_buf,
++ * resync on the 4-byte frame header, and dispatch every complete,
++ * checksum-valid frame; retain any partial trailing frame for the next call.
++ *
++ * The previous implementation assumed exactly one frame per callback and
++ * validated a single checksum over the whole buffer, which silently dropped
++ * every batch of >1 frame. That capped the usable report rate: as soon as the
++ * MCU was told to report faster than the tty flush granularity, frames batched
++ * and were discarded wholesale.
++ */
++static size_t rsinput_rx(struct serdev_device *serdev, const u8 *data, size_t count) {
++    struct rsinput_driver *drv = serdev_device_get_drvdata(serdev);
++    size_t pos = 0, n;
+ 
+-        if (len < frame_length) {
+-            return;
++    if (!drv || !data || count == 0)
++        return count;
++
++    /* Defensive: never let a run of unparseable bytes wedge the buffer. */
++    if (drv->rx_len >= sizeof(drv->rx_buf))
++        drv->rx_len = 0;
++
++    n = min(count, sizeof(drv->rx_buf) - drv->rx_len);
++    memcpy(drv->rx_buf + drv->rx_len, data, n);
++    drv->rx_len += n;
++
++    while (drv->rx_len - pos >= MCU_PKT_SIZE_MIN) {
++        const uint8_t *frame = drv->rx_buf + pos;
++        uint16_t payload_length;
++        size_t frame_length;
++
++        if (frame[0] != FRAME_HEAD_1 || frame[1] != FRAME_HEAD_2 ||
++            frame[2] != FRAME_HEAD_3 || frame[3] != FRAME_HEAD_4) {
++            pos++;              /* not on a frame boundary, resync one byte */
++            continue;
+         }
+ 
+-        uint8_t received_checksum = data[frame_length - 1];
+-        uint8_t computed_checksum = compute_checksum(data, frame_length);
+-        if (computed_checksum != received_checksum) {
+-            data += frame_length;
+-            len -= frame_length;
++        payload_length = frame[FRAME_POS_LEN_L] | (frame[FRAME_POS_LEN_H] << 8);
++        frame_length = MCU_PKT_SIZE_MIN + payload_length;
++
++        if (frame_length > MCU_PKT_SIZE_MAX) {
++            pos++;              /* implausible length: treat header as noise */
+             continue;
+         }
+ 
+-        switch (data[FRAME_POS_CMD]) {
++        if (drv->rx_len - pos < frame_length)
++            break;              /* incomplete: wait for the rest next callback */
++
++        if (compute_checksum(frame, frame_length) == frame[frame_length - 1]) {
++            switch (frame[FRAME_POS_CMD]) {
+             case CMD_COMMOD:
+-                handle_cmd_commod(drv, data, payload_length);
++                handle_cmd_commod(drv, frame, payload_length);
+                 break;
+             case CMD_STATUS:
+-                handle_cmd_status(drv, data, payload_length);
++                handle_cmd_status(drv, frame, payload_length);
+                 break;
+             default:
+-                dev_warn(&drv->serdev->dev, "Unhandled command: 0x%02X\n", data[FRAME_POS_CMD]);
++                dev_warn_ratelimited(&serdev->dev,
++                    "Unhandled command: 0x%02X\n", frame[FRAME_POS_CMD]);
+                 break;
++            }
++            pos += frame_length;
++        } else {
++            dev_warn_ratelimited(&serdev->dev, "Checksum mismatch\n");
++            pos++;              /* resync past the bogus header */
+         }
+-
+-        data += frame_length;
+-        len -= frame_length;
+-    }
+-
+-    if (len > 0) {
+-        dev_warn(&drv->serdev->dev, "Trailing bytes after processing: %zu\n", len);
+-    }
+-}
+-
+-static size_t rsinput_rx(struct serdev_device *serdev, const u8 *data, size_t count) {
+-    struct rsinput_driver *drv = serdev_device_get_drvdata(serdev);
+-    uint8_t received_checksum, computed_checksum;
+-
+-    if (!drv || !data || count == 0) {
+-        dev_warn_ratelimited(&serdev->dev, "Invalid RX data\n");
+-        goto error;
+     }
+ 
+-    if (count > sizeof(drv->rx_buf)) {
+-        dev_warn_ratelimited(&serdev->dev, "RX buffer overflow\n");
+-        goto error;
++    if (pos) {
++        drv->rx_len -= pos;
++        memmove(drv->rx_buf, drv->rx_buf + pos, drv->rx_len);
+     }
+ 
+-    memcpy(drv->rx_buf, data, count);
+-
+-    if (count < MCU_PKT_SIZE_MIN) {
+-        dev_warn_ratelimited(&serdev->dev, "Frame too short for checksum validation\n");
+-        goto error;
+-    }
+-
+-    received_checksum = drv->rx_buf[count - 1];
+-
+-    computed_checksum = compute_checksum(drv->rx_buf, count);
+-
+-    if (computed_checksum != received_checksum) {
+-        dev_warn_ratelimited(&serdev->dev, "Checksum mismatch\n");
+-        goto error;
+-    }
+-
+-    rsinput_process_data(drv, drv->rx_buf, count);
+-
+-error:
+     return count;
+ }
+ 
